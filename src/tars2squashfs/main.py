@@ -302,7 +302,7 @@ Examples:
                         help=f'Number of files to process before appending (default: {DEFAULT_BATCH_SIZE})')
     valid_compressions = ['gzip', 'lzo', 'xz', 'lz4', 'zstd']
     parser.add_argument('-c', '--compression', choices=valid_compressions,
-                        default='xz', help='Compression algorithm (default: xz)')
+                        default='lz4', help='Compression algorithm (default: xz)')
     parser.add_argument('--memory-efficient', action='store_true',
                         help='Use ultra memory-efficient mode (slower but uses minimal inodes)')
     parser.add_argument('--temp-dir', help='Temporary directory (default: system temp)')
