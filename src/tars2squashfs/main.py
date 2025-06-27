@@ -225,6 +225,10 @@ class SquashFSBuilder:
             self.files_in_batch = 0
             archive_top_dirs = set()
             
+            # Reset merge_base_dir for each archive to use this archive's temp space
+            if self.merge_duplicates:
+                self.merge_base_dir = None
+            
             try:
                 with tarfile.open(archive_path, 'r:gz') as tar:
                     # First pass: identify top-level directories
@@ -311,7 +315,10 @@ class SquashFSBuilder:
                 for member in tar:
                     if member.isfile():
                         if not self.dry_run:
-                            if self.merge_duplicates:
+                            # Get top directory for this member
+                            top_dir = self.get_top_level_dir(member.name) if self.merge_duplicates else None
+                            
+                            if self.merge_duplicates and top_dir:
                                 # Setup merge directory structure
                                 if self.merge_base_dir is None:
                                     self.merge_base_dir = batch_dir / "merged"
