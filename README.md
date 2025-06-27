@@ -2,7 +2,7 @@
 
 Convert multiple tar.gz archives into a single SquashFS filesystem with optimized memory usage and minimal inode consumption.
 
-SquashFS is a read-only filesystem that resides in a single file and can be mounted without root privileges via [squashfuse](https://github.com/vasi/squashfuse). This tool is particularly useful for creating efficient, compressed datasets for machine learning workflows in environments where the number of innodes and limited.
+SquashFS is a read-only filesystem that resides in a single file and can be mounted without root privileges via [squashfuse](https://github.com/vasi/squashfuse). This tool is particularly useful for creating efficient, compressed datasets for machine learning workflows in environments where the number of files per user is limited.
 
 
 ## Requirements
