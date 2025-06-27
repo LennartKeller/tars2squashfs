@@ -173,9 +173,10 @@ class SquashFSBuilder:
         """Analyze archives to identify duplicate directories"""
         all_top_dirs = set()
         archive_dirs = {}
-        
-        for archive in archive_list:
+        pbar = tqdm(archive_list, desc="Analyzing archives", unit="archive")
+        for archive in pbar:
             try:
+                pbar.set_postfix_str(f"Analyzing {archive.name}")
                 with tarfile.open(archive, 'r:gz') as tar:
                     dirs = set()
                     for member in tar:
