@@ -38,6 +38,7 @@ class SquashFSBuilder:
         self.merge_duplicates = merge_duplicates
         self.seen_top_dirs = set()  # Track top-level directories we've seen
         self.merge_base_dir = None  # Base directory for merging
+        self.global_merge_dir = None  # Global merge directory across all archives
         
     @contextmanager
     def temp_directory(self, prefix="squashfs_"):
@@ -168,35 +169,98 @@ class SquashFSBuilder:
         
         return self.merge_base_dir
     
+    def _analyze_archives(self, archive_list):
+        """Analyze archives to identify duplicate directories"""
+        all_top_dirs = set()
+        archive_dirs = {}
+        
+        for archive in archive_list:
+            try:
+                with tarfile.open(archive, 'r:gz') as tar:
+                    dirs = set()
+                    for member in tar:
+                        if member.isfile() or member.isdir():
+                            top_dir = self.get_top_level_dir(member.name)
+                            if top_dir:
+                                dirs.add(top_dir)
+                    archive_dirs[archive] = dirs
+                    all_top_dirs.update(dirs)
+            except Exception as e:
+                logger.warning(f"Could not analyze archive {archive}: {e}")
+                archive_dirs[archive] = set()
+        
+        # Find which directories appear in multiple archives
+        duplicate_dirs = set()
+        for top_dir in all_top_dirs:
+            archives_with_dir = [arch for arch, dirs in archive_dirs.items() if top_dir in dirs]
+            if len(archives_with_dir) > 1:
+                duplicate_dirs.add(top_dir)
+        
+        # Identify archives that contain ONLY non-duplicate directories
+        non_duplicate_archives = []
+        for archive, dirs in archive_dirs.items():
+            if not dirs.intersection(duplicate_dirs):
+                non_duplicate_archives.append(archive)
+        
+        return duplicate_dirs, non_duplicate_archives
+    
+    def _process_duplicate_content(self, archive_list, duplicate_dirs, memory_efficient):
+        """Process only the duplicate directory content with merging"""
+        if not self.dry_run:
+            global_merge_dir = tempfile.mkdtemp(prefix="global_merge_")
+        
+        try:
+            for archive in archive_list:
+                archive_has_duplicates = False
+                
+                try:
+                    with tarfile.open(archive, 'r:gz') as tar:
+                        # Check if this archive has duplicate content
+                        for member in tar:
+                            if member.isfile():
+                                top_dir = self.get_top_level_dir(member.name)
+                                if top_dir in duplicate_dirs:
+                                    archive_has_duplicates = True
+                                    break
+                        
+                        if not archive_has_duplicates:
+                            continue
+                        
+                        # Reset tar position and extract only duplicate directory content
+                        tar.close()
+                        tar = tarfile.open(archive, 'r:gz')
+                        
+                        extracted_files = 0
+                        for member in tar:
+                            if member.isfile():
+                                top_dir = self.get_top_level_dir(member.name)
+                                if top_dir in duplicate_dirs:
+                                    if not self.dry_run:
+                                        tar.extract(member, path=global_merge_dir, filter=tarfile.data_filter)
+                                    extracted_files += 1
+                                    self.total_files += 1
+                        
+                        if extracted_files > 0:
+                            logger.info(f"  Extracted {extracted_files} duplicate files from {archive.name}")
+                
+                except Exception as e:
+                    logger.error(f"Error processing duplicate content from {archive}: {e}")
+            
+            # Append merged content if any
+            if not self.dry_run and os.path.exists(global_merge_dir) and os.listdir(global_merge_dir):
+                logger.info("Appending merged duplicate content to SquashFS...")
+                self.append_to_squashfs(global_merge_dir)
+        
+        finally:
+            if not self.dry_run and 'global_merge_dir' in locals():
+                shutil.rmtree(global_merge_dir, ignore_errors=True)
+    
     def process_tar_member(self, tar, member, extract_path, top_dir=None):
         """Process a single member from tar archive"""
         if member.isfile():
             if not self.dry_run:
-                if self.merge_duplicates and top_dir:
-                    # Ensure merge directory is set up
-                    if self.merge_base_dir is None:
-                        self.merge_base_dir = extract_path / "merged"
-                        self.merge_base_dir.mkdir(exist_ok=True)
-                    
-                    # Extract to temporary location first
-                    temp_extract = extract_path / "temp_extract"
-                    temp_extract.mkdir(exist_ok=True)
-                    tar.extract(member, path=temp_extract, filter=tarfile.data_filter)
-                    
-                    # Move to merged location
-                    src = temp_extract / member.name
-                    dst = self.merge_base_dir / member.name
-                    dst.parent.mkdir(parents=True, exist_ok=True)
-                    
-                    if src.exists():
-                        if dst.exists():
-                            logger.debug(f"  Overwriting duplicate file: {member.name}")
-                        shutil.move(str(src), str(dst))
-                    
-                    # Clean up temp directory
-                    shutil.rmtree(temp_extract, ignore_errors=True)
-                else:
-                    tar.extract(member, path=extract_path, filter=tarfile.data_filter)
+                # Always extract to local temp directory for efficiency
+                tar.extract(member, path=extract_path, filter=tarfile.data_filter)
             
             self.files_in_batch += 1
             self.total_files += 1
@@ -204,17 +268,9 @@ class SquashFSBuilder:
             if self.files_in_batch >= self.batch_size:
                 logger.debug(f"  Appending batch of {self.files_in_batch} files...")
                 if not self.dry_run:
-                    append_path = self.merge_base_dir if self.merge_duplicates and self.merge_base_dir else extract_path
-                    self.append_to_squashfs(append_path)
-                    
-                    # Reset merge directory if we're merging
-                    if self.merge_duplicates and self.merge_base_dir:
-                        shutil.rmtree(self.merge_base_dir)
-                        self.merge_base_dir = extract_path / "merged"
-                        self.merge_base_dir.mkdir(exist_ok=True)
-                    else:
-                        shutil.rmtree(extract_path)
-                        os.makedirs(extract_path)
+                    self.append_to_squashfs(extract_path)
+                    shutil.rmtree(extract_path)
+                    os.makedirs(extract_path)
                 self.files_in_batch = 0
     
     def process_archive_streaming(self, archive_path):
@@ -225,9 +281,8 @@ class SquashFSBuilder:
             self.files_in_batch = 0
             archive_top_dirs = set()
             
-            # Reset merge_base_dir for each archive to use this archive's temp space
-            if self.merge_duplicates:
-                self.merge_base_dir = None
+            # Note: When merging, files go directly to global_merge_dir
+            # No need to reset merge_base_dir as it's not used in merge mode
             
             try:
                 with tarfile.open(archive_path, 'r:gz') as tar:
@@ -275,8 +330,7 @@ class SquashFSBuilder:
                     
                     if self.files_in_batch > 0:
                         logger.debug(f"  Appending final batch of {self.files_in_batch} files...")
-                        append_path = self.merge_base_dir if self.merge_duplicates and self.merge_base_dir else extract_dir
-                        self.append_to_squashfs(append_path)
+                        self.append_to_squashfs(extract_dir)
                         
             except tarfile.TarError as e:
                 logger.error(f"Error reading tar file {archive_path}: {e}")
@@ -382,13 +436,42 @@ class SquashFSBuilder:
         
         total_archives = len(archive_list)
         
-        for i, archive in enumerate(archive_list, 1):
-            logger.info(f"[{i}/{total_archives}] Processing archive...")
+        # Process archives - handle merging vs non-merging differently
+        if self.merge_duplicates:
+            # For merging: collect duplicate dirs, process non-duplicates normally
+            duplicate_dirs, non_duplicate_archives = self._analyze_archives(archive_list)
             
-            if memory_efficient:
-                self.process_archive_memory_efficient(archive)
+            if duplicate_dirs:
+                logger.info(f"Found duplicate directories: {', '.join(duplicate_dirs)}")
+                logger.info("Processing non-duplicate content first...")
+                
+                # Process archives with non-duplicate content normally (efficient)
+                for i, archive in enumerate(non_duplicate_archives, 1):
+                    logger.info(f"[{i}/{len(non_duplicate_archives)}] Processing non-duplicate archive...")
+                    if memory_efficient:
+                        self.process_archive_memory_efficient(archive)
+                    else:
+                        self.process_archive_streaming(archive)
+                
+                # Process duplicate content with merging (less efficient but necessary)
+                logger.info("Processing and merging duplicate directories...")
+                self._process_duplicate_content(archive_list, duplicate_dirs, memory_efficient)
             else:
-                self.process_archive_streaming(archive)
+                # No duplicates found, process normally
+                for i, archive in enumerate(archive_list, 1):
+                    logger.info(f"[{i}/{total_archives}] Processing archive...")
+                    if memory_efficient:
+                        self.process_archive_memory_efficient(archive)
+                    else:
+                        self.process_archive_streaming(archive)
+        else:
+            # No merging - process all archives normally (most efficient)
+            for i, archive in enumerate(archive_list, 1):
+                logger.info(f"[{i}/{total_archives}] Processing archive...")
+                if memory_efficient:
+                    self.process_archive_memory_efficient(archive)
+                else:
+                    self.process_archive_streaming(archive)
         
         logger.info(f"Successfully processed {self.total_files} files from {total_archives} archives")
         if self.dry_run:
