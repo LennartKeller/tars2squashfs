@@ -84,7 +84,7 @@ options:
   -b BATCH_SIZE, --batch-size BATCH_SIZE
                         Number of files to process before appending (default: 1000)
   -c {gzip,lzo,xz,lz4,zstd}, --compression {gzip,lzo,xz,lz4,zstd}
-                        Compression algorithm (default: xz)
+                        Compression algorithm (default: lz4)
   --memory-efficient    Use ultra memory-efficient mode (slower but uses minimal inodes)
   --temp-dir TEMP_DIR   Temporary directory (default: system temp)
   --dry-run             Show what would be done without creating files
