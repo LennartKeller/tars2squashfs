@@ -25,7 +25,7 @@ PROGRESS_UPDATE_INTERVAL = 1000
 
 
 class SquashFSBuilder:
-    def __init__(self, output_file, batch_size=1000, compression='xz', temp_dir=None, temp_base=None, dry_run=False):
+    def __init__(self, output_file, batch_size=1000, compression='xz', temp_dir=None, temp_base=None, dry_run=False, merge_duplicates=True):
         self.output_file = Path(output_file).absolute()
         self.batch_size = batch_size
         self.compression = compression
@@ -35,6 +35,9 @@ class SquashFSBuilder:
         self.total_files = 0
         self.current_batch_dir = None
         self.dry_run = dry_run
+        self.merge_duplicates = merge_duplicates
+        self.seen_top_dirs = set()  # Track top-level directories we've seen
+        self.merge_base_dir = None  # Base directory for merging
         
     @contextmanager
     def temp_directory(self, prefix="squashfs_"):
@@ -136,11 +139,52 @@ class SquashFSBuilder:
                 size_diff = size_after - size_before
                 logger.debug(f"  SquashFS grew by {size_diff / 1024 / 1024:.1f} MB (total: {size_after / 1024 / 1024:.1f} MB)")
     
-    def process_tar_member(self, tar, member, extract_path):
+    def get_top_level_dir(self, member_path):
+        """Get the top-level directory from a tar member path"""
+        parts = Path(member_path).parts
+        return parts[0] if parts else None
+    
+    def setup_merge_directory(self, extract_path, top_dir):
+        """Setup directory structure for merging duplicate top-level directories"""
+        if not self.merge_duplicates:
+            return extract_path
+        
+        if self.merge_base_dir is None:
+            self.merge_base_dir = extract_path / "merged"
+            if not self.dry_run:
+                self.merge_base_dir.mkdir(exist_ok=True)
+        
+        # Create the target directory in the merge base
+        target_dir = self.merge_base_dir / top_dir
+        if not self.dry_run:
+            target_dir.mkdir(exist_ok=True)
+        
+        return self.merge_base_dir
+    
+    def process_tar_member(self, tar, member, extract_path, top_dir=None):
         """Process a single member from tar archive"""
         if member.isfile():
             if not self.dry_run:
-                tar.extract(member, path=extract_path, filter=tarfile.data_filter)
+                if self.merge_duplicates and top_dir:
+                    # Extract to temporary location first
+                    temp_extract = extract_path / "temp_extract"
+                    temp_extract.mkdir(exist_ok=True)
+                    tar.extract(member, path=temp_extract, filter=tarfile.data_filter)
+                    
+                    # Move to merged location
+                    src = temp_extract / member.name
+                    dst = self.merge_base_dir / member.name
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    
+                    if src.exists():
+                        if dst.exists():
+                            logger.debug(f"  Overwriting duplicate file: {member.name}")
+                        shutil.move(str(src), str(dst))
+                    
+                    # Clean up temp directory
+                    shutil.rmtree(temp_extract, ignore_errors=True)
+                else:
+                    tar.extract(member, path=extract_path, filter=tarfile.data_filter)
             
             self.files_in_batch += 1
             self.total_files += 1
@@ -148,10 +192,17 @@ class SquashFSBuilder:
             if self.files_in_batch >= self.batch_size:
                 logger.debug(f"  Appending batch of {self.files_in_batch} files...")
                 if not self.dry_run:
-                    self.append_to_squashfs(extract_path)
+                    append_path = self.merge_base_dir if self.merge_duplicates and self.merge_base_dir else extract_path
+                    self.append_to_squashfs(append_path)
                     
-                    shutil.rmtree(extract_path)
-                    os.makedirs(extract_path)
+                    # Reset merge directory if we're merging
+                    if self.merge_duplicates and self.merge_base_dir:
+                        shutil.rmtree(self.merge_base_dir)
+                        self.merge_base_dir = extract_path / "merged"
+                        self.merge_base_dir.mkdir(exist_ok=True)
+                    else:
+                        shutil.rmtree(extract_path)
+                        os.makedirs(extract_path)
                 self.files_in_batch = 0
     
     def process_archive_streaming(self, archive_path):
@@ -160,17 +211,38 @@ class SquashFSBuilder:
         
         with self.temp_directory(prefix="extract_") as extract_dir:
             self.files_in_batch = 0
+            archive_top_dirs = set()
             
             try:
                 with tarfile.open(archive_path, 'r:gz') as tar:
-
+                    # First pass: identify top-level directories
+                    if self.merge_duplicates:
+                        for member in tar:
+                            if member.isfile() or member.isdir():
+                                top_dir = self.get_top_level_dir(member.name)
+                                if top_dir:
+                                    archive_top_dirs.add(top_dir)
+                        
+                        # Check for duplicates and log merge operations
+                        duplicate_dirs = archive_top_dirs.intersection(self.seen_top_dirs)
+                        if duplicate_dirs:
+                            logger.info(f"  Merging duplicate directories: {', '.join(duplicate_dirs)}")
+                        
+                        # Update seen directories
+                        self.seen_top_dirs.update(archive_top_dirs)
+                        
+                        # Reset tar file position for second pass
+                        tar.close()
+                        tar = tarfile.open(archive_path, 'r:gz')
+                    
                     file_count = 0
                     pbar = tqdm(desc=f"Processing {archive_path.name}", unit="file", dynamic_ncols=True)
                     
                     for member in tar:
                         if member.isfile():
                             file_count += 1
-                            self.process_tar_member(tar, member, extract_dir)
+                            top_dir = self.get_top_level_dir(member.name) if self.merge_duplicates else None
+                            self.process_tar_member(tar, member, extract_dir, top_dir)
                             pbar.update(1)
                             
                             if logging.DEBUG >= logging.root.level and file_count % PROGRESS_UPDATE_INTERVAL == 0:
@@ -184,7 +256,8 @@ class SquashFSBuilder:
                     
                     if self.files_in_batch > 0:
                         logger.debug(f"  Appending final batch of {self.files_in_batch} files...")
-                        self.append_to_squashfs(extract_dir)
+                        append_path = self.merge_base_dir if self.merge_duplicates and self.merge_base_dir else extract_dir
+                        self.append_to_squashfs(append_path)
                         
             except tarfile.TarError as e:
                 logger.error(f"Error reading tar file {archive_path}: {e}")
@@ -199,38 +272,85 @@ class SquashFSBuilder:
         
         with self.temp_directory(prefix="batch_") as batch_dir:
             self.files_in_batch = 0
+            archive_top_dirs = set()
+            
+            # First pass: identify top-level directories if merging
+            if self.merge_duplicates:
+                with tarfile.open(archive_path, 'r:gz') as tar:
+                    for member in tar:
+                        if member.isfile() or member.isdir():
+                            top_dir = self.get_top_level_dir(member.name)
+                            if top_dir:
+                                archive_top_dirs.add(top_dir)
+                
+                # Check for duplicates and log merge operations
+                duplicate_dirs = archive_top_dirs.intersection(self.seen_top_dirs)
+                if duplicate_dirs:
+                    logger.info(f"  Merging duplicate directories: {', '.join(duplicate_dirs)}")
+                
+                # Update seen directories
+                self.seen_top_dirs.update(archive_top_dirs)
             
             with tarfile.open(archive_path, 'r:gz') as tar:
                 pbar = tqdm()
                 for member in tar:
                     if member.isfile():
                         if not self.dry_run:
-                            temp_extract = Path(batch_dir) / "temp_extract"
-                            temp_extract.mkdir(exist_ok=True)
-                            
-                            tar.extract(member, path=temp_extract, filter=tarfile.data_filter)
-                            
-                            src = temp_extract / member.name
-                            dst = Path(batch_dir) / member.name
-                            dst.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.move(str(src), str(dst))
-                            
-                            shutil.rmtree(temp_extract)
+                            if self.merge_duplicates:
+                                # Setup merge directory structure
+                                if self.merge_base_dir is None:
+                                    self.merge_base_dir = batch_dir / "merged"
+                                    self.merge_base_dir.mkdir(exist_ok=True)
+                                
+                                temp_extract = Path(batch_dir) / "temp_extract"
+                                temp_extract.mkdir(exist_ok=True)
+                                
+                                tar.extract(member, path=temp_extract, filter=tarfile.data_filter)
+                                
+                                src = temp_extract / member.name
+                                dst = self.merge_base_dir / member.name
+                                dst.parent.mkdir(parents=True, exist_ok=True)
+                                
+                                if dst.exists():
+                                    logger.debug(f"  Overwriting duplicate file: {member.name}")
+                                shutil.move(str(src), str(dst))
+                                
+                                shutil.rmtree(temp_extract)
+                            else:
+                                temp_extract = Path(batch_dir) / "temp_extract"
+                                temp_extract.mkdir(exist_ok=True)
+                                
+                                tar.extract(member, path=temp_extract, filter=tarfile.data_filter)
+                                
+                                src = temp_extract / member.name
+                                dst = Path(batch_dir) / member.name
+                                dst.parent.mkdir(parents=True, exist_ok=True)
+                                shutil.move(str(src), str(dst))
+                                
+                                shutil.rmtree(temp_extract)
+                        
                         pbar.update(1)
                         self.files_in_batch += 1
                         self.total_files += 1
                         
                         if self.files_in_batch >= self.batch_size:
                             logger.debug(f"  Appending batch of {self.files_in_batch} files...")
-                            self.append_to_squashfs(batch_dir)
+                            append_path = self.merge_base_dir if self.merge_duplicates and self.merge_base_dir else batch_dir
+                            self.append_to_squashfs(append_path)
                             if not self.dry_run:
-                                shutil.rmtree(batch_dir)
-                                os.makedirs(batch_dir)
+                                if self.merge_duplicates and self.merge_base_dir:
+                                    shutil.rmtree(self.merge_base_dir)
+                                    self.merge_base_dir = batch_dir / "merged"
+                                    self.merge_base_dir.mkdir(exist_ok=True)
+                                else:
+                                    shutil.rmtree(batch_dir)
+                                    os.makedirs(batch_dir)
                             self.files_in_batch = 0
                 
                 if self.files_in_batch > 0:
                     logger.debug(f"  Appending final batch of {self.files_in_batch} files...")
-                    self.append_to_squashfs(batch_dir)
+                    append_path = self.merge_base_dir if self.merge_duplicates and self.merge_base_dir else batch_dir
+                    self.append_to_squashfs(append_path)
     
     def build_from_archives(self, archive_list, memory_efficient=False):
         """Build squashfs from list of archives"""
@@ -305,6 +425,8 @@ Examples:
                         default='lz4', help='Compression algorithm (default: xz)')
     parser.add_argument('--memory-efficient', action='store_true',
                         help='Use ultra memory-efficient mode (slower but uses minimal inodes)')
+    parser.add_argument('--no-merge-duplicates', action='store_true',
+                        help='Disable merging of duplicate top-level directories (default: merge enabled)')
     parser.add_argument('--temp-dir', help='Temporary directory (default: system temp)')
     parser.add_argument('--dry-run', action='store_true',
                         help='Show what would be done without creating the squashfs file')
@@ -347,6 +469,7 @@ Examples:
     logger.info(f"  Batch size: {args.batch_size}")
     logger.info(f"  Compression: {args.compression}")
     logger.info(f"  Mode: {'memory-efficient' if args.memory_efficient else 'streaming'}")
+    logger.info(f"  Merge duplicates: {'disabled' if args.no_merge_duplicates else 'enabled'}")
     if args.temp_dir:
         logger.info(f"  Temp directory: {args.temp_dir}")
     if args.dry_run:
@@ -358,7 +481,8 @@ Examples:
         batch_size=args.batch_size,
         compression=args.compression,
         temp_dir=args.temp_dir,
-        dry_run=args.dry_run
+        dry_run=args.dry_run,
+        merge_duplicates=not args.no_merge_duplicates
     )
     
     try:
