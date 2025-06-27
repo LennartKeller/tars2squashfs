@@ -172,7 +172,12 @@ class SquashFSBuilder:
         """Process a single member from tar archive"""
         if member.isfile():
             if not self.dry_run:
-                if self.merge_duplicates and top_dir and self.merge_base_dir:
+                if self.merge_duplicates and top_dir:
+                    # Ensure merge directory is set up
+                    if self.merge_base_dir is None:
+                        self.merge_base_dir = extract_path / "merged"
+                        self.merge_base_dir.mkdir(exist_ok=True)
+                    
                     # Extract to temporary location first
                     temp_extract = extract_path / "temp_extract"
                     temp_extract.mkdir(exist_ok=True)
