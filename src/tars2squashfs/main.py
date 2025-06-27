@@ -141,12 +141,19 @@ class SquashFSBuilder:
     
     def get_top_level_dir(self, member_path):
         """Get the top-level directory from a tar member path"""
+        if not member_path or member_path == '.':
+            return None
         parts = Path(member_path).parts
-        return parts[0] if parts else None
+        if not parts:
+            return None
+        # Skip if it's just a filename without directory
+        if len(parts) == 1 and '.' in parts[0]:
+            return None
+        return parts[0]
     
     def setup_merge_directory(self, extract_path, top_dir):
         """Setup directory structure for merging duplicate top-level directories"""
-        if not self.merge_duplicates:
+        if not self.merge_duplicates or not top_dir:
             return extract_path
         
         if self.merge_base_dir is None:
@@ -165,7 +172,7 @@ class SquashFSBuilder:
         """Process a single member from tar archive"""
         if member.isfile():
             if not self.dry_run:
-                if self.merge_duplicates and top_dir:
+                if self.merge_duplicates and top_dir and self.merge_base_dir:
                     # Extract to temporary location first
                     temp_extract = extract_path / "temp_extract"
                     temp_extract.mkdir(exist_ok=True)
@@ -242,6 +249,9 @@ class SquashFSBuilder:
                         if member.isfile():
                             file_count += 1
                             top_dir = self.get_top_level_dir(member.name) if self.merge_duplicates else None
+                            # Setup merge directory if we have a valid top_dir
+                            if self.merge_duplicates and top_dir:
+                                self.setup_merge_directory(extract_dir, top_dir)
                             self.process_tar_member(tar, member, extract_dir, top_dir)
                             pbar.update(1)
                             
